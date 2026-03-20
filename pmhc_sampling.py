@@ -277,7 +277,7 @@ def explore(df: pd.DataFrame, out_dir: Path) -> None:
     allele_counts = df[COL_MHC].value_counts().sort_values()
     fig, ax = plt.subplots(figsize=(12, 4))
     ax.bar(range(len(allele_counts)), allele_counts.values, width=1.0, color="steelblue")
-    ax.set_title(f"Peptide count per MHC allele -- raw non-binders\n"
+    ax.set_title(f"Peptide count per MHC allele\n"
                  f"n_alleles={len(allele_counts):,}  median={int(allele_counts.median()):,}  "
                  f"max={allele_counts.max():,}")
     ax.set_ylabel("Count")
@@ -305,7 +305,7 @@ def explore(df: pd.DataFrame, out_dir: Path) -> None:
     len_counts = df["pep_len"].value_counts().sort_index()
     fig, ax = plt.subplots(figsize=(8, 4))
     len_counts.plot(kind="bar", ax=ax, color="coral", edgecolor="white")
-    ax.set_title("Peptide length distribution -- raw non-binders")
+    ax.set_title("Peptide length distribution")
     ax.set_xlabel("Length (aa)")
     ax.set_ylabel("Count")
     for bar in ax.patches:
@@ -320,8 +320,8 @@ def explore(df: pd.DataFrame, out_dir: Path) -> None:
     for ax, col, title in zip(
         axes,
         ["a1_res", "a2_res"],
-        ["Anchor 1 (P2) residue frequency -- raw non-binders",
-         "Anchor 2 (last pos) residue frequency -- raw non-binders"],
+        ["Anchor 1 (P2) residue frequency",
+         "Anchor 2 (last pos) residue frequency"],
     ):
         counts = df[col].value_counts().sort_index()
         counts.plot(kind="bar", ax=ax, color="mediumseagreen", edgecolor="white")
@@ -337,7 +337,7 @@ def explore(df: pd.DataFrame, out_dir: Path) -> None:
         source_counts = df["source"].value_counts()
         fig, ax = plt.subplots(figsize=(8, 4))
         source_counts.plot(kind="barh", ax=ax, color="mediumpurple")
-        ax.set_title("Data source distribution -- raw non-binders")
+        ax.set_title("Data source distribution")
         ax.set_xlabel("Count")
         plt.tight_layout()
         fig.savefig(out_dir / "00_raw_source_distribution.png", dpi=150)
