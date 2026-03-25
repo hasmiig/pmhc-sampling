@@ -2,3 +2,4 @@
 *.csv
 plots*/
 __pycache__/
+scripts/
