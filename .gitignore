@@ -1,6 +1,11 @@
 *.parquet
 *.csv
 plots*/
+data/
+logs/
+outputs/
 __pycache__/
 scripts/
 PMGen/
+miniforge*/
+Miniforge3-*.sh
