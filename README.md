@@ -1,19 +1,55 @@
-# pMHC Peptide Sampling Pipeline
+# ProteinMPNN Fine-tuning — pMHC Data Preparation
 
-A two-phase iterative sampling pipeline for balancing peptide-MHC (pMHC) class I datasets — for both binder and non-binder peptides — prior to downstream tasks such as structure prediction and model training.
+End-to-end pipeline for curating a high-quality dataset of pMHC class I binder structures for fine-tuning ProteinMPNN. Starting from raw IEDB exports, the pipeline produces balanced, structure-predicted, QC-filtered datasets in ProteinMPNN-ready JSONL format with MHC chain fixed and peptide chain designable.
+
+This project is part of the **PMGen / FinetuneMPNN** effort. For full methodology and design decisions, see [docs/METHODOLOGY.md](docs/METHODOLOGY.md).
 
 ---
 
-## Background
+## Overview
 
-Raw pMHC datasets are heavily imbalanced: some MHC alleles have thousands of peptides while others have only a handful, and within each allele certain amino acids dominate the anchor positions (P2 and last position). This imbalance can introduce inductive bias into any model trained on the data.
+```
+IEDB export (binders only)
+    │
+    ▼
+01_data_preparation/      ← filter to binders, deduplicate, balance alleles
+    │
+    ▼
+02_structure_prediction/  ← prepare PMGen input, run structure prediction
+    │
+    ▼
+03_filtering_analysis/    ← pLDDT QC, re-balance, produce ProteinMPNN JSONL splits
+    │
+    ▼
+data.jsonl + fixed_positions.json  (per train/val/test fold)
+```
 
-This pipeline addresses this in two sequential phases:
+---
 
-- **Phase 1** — balances peptide counts *across* MHC alleles using iterative median sampling, capped at `SAMPLE_CAP` (default: 1000) peptides per allele
-- **Phase 2** — within each allele independently, balances anchor residue diversity at position P2 (anchor 1) and the last peptide position (anchor 2) using the same iterative median sampling strategy
+## Repository Structure
 
-The pipeline can be run in `--mode nonbinder` or `--mode binder` to process each class separately, and with `--phases both` or `--phases only_phase1` depending on whether anchor balancing is needed.
+```
+proteinmpnn-finetune-data-prep/
+├── scripts/
+│   ├── 01_data_preparation/
+│   │   ├── pmhc_sampling.py         # Iterative median sampling (allele balancing)
+│   ├── 02_structure_prediction/
+│   │   ├── prepare_pmgen_input.py   # Build TSV input for PMGen
+│   │   └── chunk_tsv.py             # Split large files for parallel processing
+│   │   └── run_pmgen.sh             # SLURM job script for PMGen structure prediction
+│   ├── 03_filtering_analysis/
+│   │   ├── compute_plddt_means.py   # Extract mean pLDDT per structure
+│   │   ├── analyse_plddt.py         # Visualize pLDDT distributions, apply threshold
+│   │   ├── filter_map_train_prep.py # Filter, re-sample, produce train/val/test splits
+│   │   └── prepare_pmhc_data.py     # Convert split parquets → ProteinMPNN JSONL
+│   └── utils/
+│       ├── setup_env.sh             # Environment setup for cluster jobs
+│       └── submit_prepare_pmhc.sh   # Batch submission helper
+├── docs/
+│   ├── METHODOLOGY.md               # Full design rationale and statistics
+│   └── <dated run logs>/            # Per-run exploration outputs
+└── README.md
+```
 
 ---
 
@@ -24,20 +60,71 @@ pandas
 numpy
 matplotlib
 scipy
-pyarrow        # for .parquet files
+pyarrow     # for .parquet files
 ```
-
-Install with:
 
 ```bash
 pip install pandas numpy matplotlib scipy pyarrow
 ```
 
+Structure prediction requires PMGen and a GPU node (see `scripts/utils/setup_env.sh`).
+
 ---
 
-## Input Format
+## Stage 1 — Data Preparation
 
-The pipeline accepts `.parquet`, `.tsv`, `.txt`, or `.csv` files. The input file must contain at minimum the following columns:
+**Directory:** `scripts/01_data_preparation/`
+
+**Methodology:** See [docs/2026-03-25_subsampling/README.md](docs/2026-03-25_subsampling/README.md) for detailed rationale on two-phase sampling strategy.
+
+### 1a. Inspect raw IEDB export
+
+Verify data structure and columns before processing:
+
+```bash
+python pmhc_sampling.py --input iedb_export.csv --inspect
+```
+
+Prints schema and first rows. Verify column names match the constants at the top of `pmhc_sampling.py` (see [Input column requirements](#input-column-requirements) below).
+
+### 1b. Explore raw binder distributions (optional)
+
+Understand allele and anchor composition before sampling:
+
+```bash
+python pmhc_sampling.py \
+    --input iedb_export.csv \
+    --mode binder \
+    --explore \
+    --plots exploration_raw/
+```
+
+### 1c. Filter, deduplicate, balance, and generate plots (**REQUIRED**)
+
+After inspection/exploration, perform the full data preparation:
+
+```bash
+python pmhc_sampling.py \
+    --input iedb_export.csv \
+    --mode binder \
+    --phases only_phase1 \
+    --output binders_sampled.parquet \
+    --plots results/binders/
+```
+
+This single command performs:
+
+1. **Filter** — Keep MHC class I binders only (`assigned_label == 1.0`, `mhc_class == 1.0`)
+2. **Deduplicate** — Remove exact duplicates by (peptide, allele) pair
+3. **Validate** — Remove peptides with non-standard amino acids or length ≥ 15 residues
+4. **Phase 1 Balancing** — Iterative median sampling to balance allele representation (cap: 1000 peptides per allele)
+5. **Generate Plots** — Summary statistics and allele/anchor distributions to `results/binders/`
+
+**Phase 1 only (not Phase 2):** Anchor residue preferences in binders reflect biological MHC-peptide constraints and should not be down-sampled. Phase 2 anchor balancing is only applied to non-binder datasets.
+
+**Output:** `binders_sampled.parquet` — ready for Stage 2 (structure prediction).
+
+### Input column requirements
 
 | Column | Description |
 |---|---|
@@ -46,161 +133,135 @@ The pipeline accepts `.parquet`, `.tsv`, `.txt`, or `.csv` files. The input file
 | `assigned_label` | Binding label: `1.0` = binder, `0.0` = non-binder |
 | `mhc_class` | MHC class: `1.0` = class I, `2.0` = class II |
 
-> **Important:** these column names are defined as constants at the top of the script (`COL_PEPTIDE`, `COL_MHC`, `COL_LABEL`, `MHC_CLASS`). If your input file uses different column names, update these constants before running — see [Adapting to a New Dataset](#adapting-to-a-new-dataset) below.
-
----
-
-## Usage
-
-### Step 0 — Inspect the file
-
-Before running the pipeline on a new dataset, always inspect it first:
-
-```bash
-python pmhc_sampling.py --input data.parquet --inspect
-```
-
-This prints the file schema, column names, data types, and the first 5 rows without loading the full dataset. Use this to verify that:
-- The column names in your file match the constants at the top of the script (`COL_PEPTIDE`, `COL_MHC`, `COL_LABEL`, `MHC_CLASS`)
-- The label values are as expected (`0.0` / `1.0`)
-- The MHC class column is correctly populated
-
-If the column names differ from the defaults, update the constants at the top of `pmhc_sampling.py` to match your dataset before proceeding.
-
----
-
-### Step 1 — Explore the raw data (optional but recommended)
-
-Run in exploration mode to generate diagnostic plots of the raw data without doing any sampling:
-
-```bash
-# non-binders
-python pmhc_sampling.py --input data.parquet --mode nonbinder --explore --plots plots/nonbinders/
-
-# binders
-python pmhc_sampling.py --input data.parquet --mode binder --explore --plots plots/binders/
-```
-
-This saves plots showing:
-- Allele distribution (sorted by count)
-- Top 20 most and least frequent alleles
-- Peptide length distribution
-- Anchor residue (P2 and last position) frequencies
-- Data source distribution (if a `source` column is present)
-
-Use these to understand the shape of the raw data before committing to a full run.
-
----
-
-### Step 2 — Run the full pipeline
-
-**Both phases (recommended for non-binders):**
-```bash
-python pmhc_sampling.py \
-    --input data.parquet \
-    --mode nonbinder \
-    --phases both \
-    --output nonbinders_sampled.parquet \
-    --plots plots/nonbinders/
-```
-
-**Phase 1 only (recommended for binders, where anchor dominance is biological):**
-```bash
-python pmhc_sampling.py \
-    --input data.parquet \
-    --mode binder \
-    --phases only_phase1 \
-    --output binders_sampled.parquet \
-    --plots plots/binders/
-```
-
-When running with `--phases both`, the pipeline will:
-1. Filter to MHC class I peptides of the specified type (binder or non-binder)
-2. Remove duplicates (same peptide + allele pair)
-3. Remove peptides with non-standard amino acid characters (e.g. placeholders, rare AAs)
-4. Remove peptides of length ≥ 15 (too few survive sampling to be useful)
-5. Run Phase 1: iterative median sampling across alleles
-6. Run Phase 2: iterative median sampling of anchor residues within each allele
-7. Save all plots, statistics, and the final sampled dataset
-
-When running with `--phases only_phase1`, steps 1–5 and 7 are run but Phase 2 is skipped. All plots are still generated but show only two stages (Raw and Post-Phase 1) instead of three.
-
----
-
-## All CLI Arguments
-
-| Argument | Required | Description |
-|---|---|---|
-| `--input` | Yes | Path to input file (`.parquet`, `.tsv`, `.csv`) |
-| `--mode` | Yes (for sampling) | `binder` or `nonbinder` |
-| `--phases` | No | `both` (default) or `only_phase1` — whether to run anchor balancing |
-| `--output` | Yes (for sampling) | Path to save the final sampled dataset |
-| `--plots` | No | Directory for plots and stats (default: `plots/`) |
-| `--inspect` | No | Print schema and first rows, then exit. `--mode` not required. |
-| `--explore` | No | Generate raw data plots only, no sampling |
-
----
-
-## Outputs
-
-All plots and stats are saved to the `--plots` directory. The final sampled dataset is saved to `--output`. Files marked with * are only produced when `--phases both` is used.
-
-### Statistics
-| File | Description |
-|---|---|
-| `stats_report.txt` | Full text summary of row counts, allele counts, peptide lengths, anchor frequencies at each pipeline stage |
-| `stats_summary.csv` | Numeric summary table, one row per stage |
-
-### Comparison Plots
-| File | Description |
-|---|---|
-| `comparison_allele_distribution.png` | Peptide count per allele at each stage (2 or 3 panels depending on `--phases`) |
-| `comparison_peptide_lengths.png` | Peptide length distribution at each stage |
-| `comparison_anchor1_residues.png` | Global P2 anchor residue frequencies at each stage |
-| `comparison_anchor2_residues.png` | Global last-position anchor residue frequencies at each stage |
-
-### Per-allele Anchor Plots
-| File | Description |
-|---|---|
-| `per_allele_anchor1_postphase1.png` | Per-allele P2 anchor AA fractions after Phase 1 (50 alleles per panel) |
-| `per_allele_anchor2_postphase1.png` | Per-allele last-position anchor AA fractions after Phase 1 |
-| `per_allele_anchor1_postphase2.png` * | Per-allele P2 anchor AA fractions after Phase 2 |
-| `per_allele_anchor2_postphase2.png` * | Per-allele last-position anchor AA fractions after Phase 2 |
-
-### KL Divergence
-| File | Description |
-|---|---|
-| `anchor_kl_divergence_boxplot.png` | Per-allele KL divergence vs Uniform(1/20) for both anchor positions. Includes reference lines for canonical dominance baselines (top-1, 2, 4, 8, 16 AA). Shows one box per stage. |
-| `high_kl_alleles.csv` * | Alleles where anchor dominance persists after Phase 2 — flagged when KL is above the top-16 AA baseline AND reduced by less than 5% between phases. |
-
-### Anchor Combination
-| File | Description |
-|---|---|
-| `anchor_combo_heatmap.png` | 20×20 heatmap of anchor combination counts (P2 × last position) at each stage (2 or 3 panels depending on `--phases`) |
-| `anchor_combo_stats.csv` | Per-allele anchor combination diversity statistics for the final stage |
-
-### Sampled Dataset
-| File | Description |
-|---|---|
-| `<output>` | Final sampled dataset after Phase 1 or both phases, ready for downstream use |
-
----
-
-## Adapting to a New Dataset
-
-If your input file uses different column names, update the constants at the top of `pmhc_sampling.py`:
+If your file uses different column names, update the constants at the top of `pmhc_sampling.py`:
 
 ```python
-COL_PEPTIDE = "long_mer"       # column containing the peptide sequence
-COL_MHC     = "allele"         # column containing the MHC allele name
-COL_LABEL   = "assigned_label" # column containing the binding label (0.0 / 1.0)
-MHC_CLASS   = "mhc_class"      # column containing the MHC class (1.0 / 2.0)
+COL_PEPTIDE = "long_mer"
+COL_MHC     = "allele"
+COL_LABEL   = "assigned_label"
+MHC_CLASS   = "mhc_class"
+SAMPLE_CAP  = 1000
 ```
 
-You can also adjust the following constants:
+---
 
-```python
-SAMPLE_CAP      = 1000   # maximum peptides per allele after Phase 1
-MAX_PEPTIDE_LEN = 15     # peptides of this length or longer are removed
+## Stage 2 — Structure Prediction
+
+**Directory:** `scripts/02_structure_prediction/`
+
+### 2a. Prepare PMGen input
+
+```bash
+python prepare_pmgen_input.py
 ```
 
+Merges sampled peptides with MHC sequences from `mhc1_encodings.csv` and writes a TSV for PMGen. Update the hardcoded paths at the top of the script to point to your parquet and MHC encoding files.
+
+### 2b. Chunk TSV for parallel processing
+
+Split the large TSV into smaller chunks for parallel structure prediction:
+
+```bash
+python chunk_tsv.py --input pmgen_input.tsv --size 4000 --output chunks/
+```
+
+Creates multiple `chunk_*.tsv` files in the `chunks/` directory (adjust `--size` based on available GPU memory and job duration preferences).
+
+### 2c. Run PMGen on the cluster
+
+```bash
+for chunk in chunks/*.tsv; do
+    sbatch run_pmgen.sh $chunk
+done
+```
+
+Each job runs PMGen in `--initial_guess --multiple_anchors` mode, generating two structures per pMHC pair. PDB outputs are written to `outputs/<chunk>/`.
+
+---
+
+## Stage 3 — Filtering, Splitting, and ProteinMPNN Format Conversion
+
+**Directory:** `scripts/03_filtering_analysis/`
+
+### 3a. Extract pLDDT means
+
+```bash
+python compute_plddt_means.py
+```
+
+Reads PMGen PDB outputs and writes `plddt_means_binder.csv` with per-structure mean peptide pLDDT and anchor pLDDT.
+
+### 3b. Analyse pLDDT distributions
+
+```bash
+python analyse_plddt.py
+```
+
+Generates pLDDT histograms, applies the 80-threshold filter, and saves the best structure per (allele, peptide) pair to `plddt_means_binder_best.csv`.
+
+### 3c. Filter, re-sample, and split
+
+```bash
+python filter_map_train_prep.py \
+    --plddt_csv      outputs/binder/plddt_means_binder.csv \
+    --parquet        iedb_mhc1_binders.parquet \
+    --mhc_encodings  data/mhc1_encodings.csv \
+    --pdb_base_dir   outputs/binder \
+    --output_dir     trainprep/binder/ \
+    --mode           binder \
+    --plddt_threshold 80 \
+    --k              5 \
+    --split_mode     hla
+```
+
+Four sequential stages:
+
+1. **Filter** — select best structure per (allele, peptide); apply pLDDT threshold
+2. **Map** — join back to original parquet to recover metadata and MHC sequences
+3. **Resample** — re-run iterative median sampling to correct any allele bias from prediction
+4. **Split** — train/val/test splits in one of two modes:
+   - `hla` — rare alleles (bottom 20% by frequency) held out as test; k-fold CV on remainder
+   - `anchor` — k-fold CV stratified by anchor residue combinations (P2 × C-terminal)
+
+### 3d. Convert to ProteinMPNN JSONL format
+
+```bash
+python prepare_pmhc_data.py \
+    --splits_dir trainprep/binder/splits/hla \
+    --output_dir proteinmpnn_input/binder_hla \
+    --split_mode hla
+```
+
+Reads each split parquet, finds the corresponding PDB files, and writes:
+- `data.jsonl` — ProteinMPNN-format structure records
+- `fixed_positions.json` — chain A (MHC) fixed, chain P (peptide) designable
+
+Output structure (HLA mode):
+```
+proteinmpnn_input/binder_hla/
+  test/
+    data.jsonl
+    fixed_positions.json
+  fold_1/
+    train/  val/
+  fold_2/ ... fold_5/
+```
+
+---
+
+## Key Numbers
+
+| Stage | Count |
+|---|---|
+| Initial IEDB MHC-I binders | ~250,000 |
+| After allele balancing | ~100,000 |
+| After structure prediction (pLDDT ≥ 80) | 87,187 |
+| After final re-balancing | **63,817** |
+| Unique MHC-I alleles | 426 |
+
+---
+
+## Documentation
+
+- [docs/METHODOLOGY.md](docs/METHODOLOGY.md) — rationale for binders-only approach, sampling strategy, pLDDT thresholds, splitting design
+- `docs/<date>/` — per-run exploration plots and stats
